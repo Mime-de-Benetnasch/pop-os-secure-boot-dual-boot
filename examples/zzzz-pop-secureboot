@@ -1,0 +1,109 @@
+#!/bin/bash
+# Plantilla para initramfs-tools: se invoca con VERSION RUTA_INITRAMFS.
+set -Eeuo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
+umask 077
+
+fail() {
+    printf 'Pop Secure Boot: %s\n' "$*" >&2
+    exit 1
+}
+
+trap 'printf "Pop Secure Boot: error en línea %s; verifica la UKI antes de reiniciar.\n" "$LINENO" >&2' ERR
+
+(( EUID == 0 )) || fail 'se requiere root'
+[[ $# == 2 ]] || fail 'se esperaba VERSION RUTA_INITRAMFS'
+readonly release_pattern='^[0-9][[:alnum:].+_~-]*$'
+readonly version="$1" initrd="$2"
+[[ $version =~ $release_pattern ]] || fail 'versión no válida'
+
+readonly kernel="/boot/vmlinuz-$version"
+[[ $initrd == "/boot/initrd.img-$version" && -s $initrd && ! -L $initrd ]] ||
+    fail 'initramfs inesperado o ausente'
+[[ -s $kernel && ! -L $kernel ]] || fail 'kernel ausente o no es un archivo directo'
+[[ -f $kernel && -f $initrd ]] || fail 'se esperaban archivos regulares'
+
+readonly keys=/root/pop-secureboot cfg=/etc/pop-secureboot esp=/boot/efi
+readonly dest_dir="$esp/EFI/PopSecureBoot"
+readonly target="$dest_dir/grubx64.efi"
+
+[[ -s $cfg/cmdline && -s $cfg/esp-partuuid && -f $cfg/dkms-modules ]] ||
+    fail 'faltan cmdline, esp-partuuid o dkms-modules'
+[[ -s $keys/boot.key && -s $keys/boot.crt ]] || fail 'faltan los archivos de firma EFI'
+expected=$(<"$cfg/esp-partuuid")
+[[ $expected =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]] ||
+    fail 'esp-partuuid debe contener un GUID GPT'
+
+check_esp() {
+    local fstype actual
+    read -r fstype actual < <(findmnt -rn --mountpoint "$esp" -o FSTYPE,PARTUUID) ||
+        fail 'no se puede identificar la partición EFI montada'
+    [[ $fstype == vfat && ${actual,,} == "${expected,,}" && -d $dest_dir ]] ||
+        fail 'la partición EFI esperada no está montada o falta el directorio'
+}
+
+# Serializa publicaciones y no sustituye una UKI válida por otra más antigua.
+exec 9>"$keys/.uki-update.lock"
+flock -x 9
+check_esp
+if [[ -e $target ]]; then
+    sbverify --cert "$keys/boot.crt" "$target" >/dev/null ||
+        fail 'la UKI vigente no verifica; revisa el archivo antes de sustituirlo'
+    previous=$(ukify inspect "$target" --section=.uname:text --json=short |
+        python3 -c 'import json,sys; print(json.load(sys.stdin)[".uname"]["text"].strip("\0 \n"))')
+    [[ $previous =~ $release_pattern ]] || fail 'no se pudo identificar la versión vigente'
+    if linux-version compare "$version" lt "$previous"; then
+        printf 'Pop Secure Boot: se conserva el kernel %s; %s es anterior.\n' "$previous" "$version"
+        exit 0
+    fi
+fi
+
+# Solo para módulos que deban estar firmados con nuestra clave de DKMS.
+# El campo sig_key se contrasta con el serial que muestran las firmas de
+# DKMS en el entorno probado; no es una verificación criptográfica del módulo.
+serial=
+while IFS= read -r module || [[ -n $module ]]; do
+    [[ -z $module || $module == \#* ]] && continue
+    [[ $module =~ ^[[:alnum:]_][[:alnum:]_-]*$ ]] ||
+        fail "nombre inválido en dkms-modules: $module"
+    if [[ -z $serial ]]; then
+        [[ -s $keys/dkms.der ]] || fail 'falta el certificado DER de DKMS'
+        serial=$(openssl x509 -inform DER -in "$keys/dkms.der" -noout -serial)
+        serial=${serial#serial=}
+        [[ $serial =~ ^[[:xdigit:]]+$ ]] || fail 'serial de DKMS inválido'
+    fi
+    signature=$(modinfo -k "$version" -F sig_key "$module") ||
+        fail "falta el módulo $module para $version"
+    signature=${signature//:/}
+    [[ -n $signature && ${signature^^} == "${serial^^}" ]] ||
+        fail "el módulo $module no muestra el identificador de firma DKMS esperado"
+done < "$cfg/dkms-modules"
+
+work=
+staged=
+cleanup() {
+    if [[ -n $staged ]]; then rm -f -- "$staged"; fi
+    if [[ -n $work ]]; then
+        rm -f -- "$work/popos.efi"
+        rmdir -- "$work" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+work=$(mktemp -d "$keys/.uki-update.XXXXXX")
+ukify --config=/dev/null build --linux="$kernel" --initrd="$initrd" \
+    --cmdline="@$cfg/cmdline" --uname="$version" --os-release=@/etc/os-release \
+    --secureboot-private-key="$keys/boot.key" \
+    --secureboot-certificate="$keys/boot.crt" --output="$work/popos.efi"
+sbverify --cert "$keys/boot.crt" "$work/popos.efi"
+
+# Verifica la copia en la misma ESP antes del renombrado.
+check_esp
+staged=$(mktemp "$dest_dir/.popos-uki.XXXXXX")
+cp -- "$work/popos.efi" "$staged"
+sbverify --cert "$keys/boot.crt" "$staged"
+sync -f "$staged"
+mv -fT -- "$staged" "$target"
+staged=
+sync -f "$dest_dir"
+printf 'Pop Secure Boot: UKI firmada publicada para %s.\n' "$version"
